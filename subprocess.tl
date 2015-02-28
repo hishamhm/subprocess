@@ -52,7 +52,7 @@ local active: {Popen} = {}
 local function cleanup()
    local mark: {integer} = {}
    for i, inst in ipairs(active) do
-      local res = inst:poll({ deadstate = math.maxinteger })
+      local res = inst:poll(math.maxinteger)
       if res then
          table.insert(mark, i)
       end
@@ -69,7 +69,7 @@ local Popen_metatable = {
          return
       end
       -- In case the child hasn't been waited on, check if it's done.
-      self:poll({ deadstate = maxinteger })
+      self:poll(math.maxinteger)
       if not self.returncode then
          -- Child is still running, keep us alive until we can wait on it.
          table.insert(active, self)
@@ -141,7 +141,6 @@ end
 
 function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
    local pass_fds = args.pass_fds or {}
-   local preexec_fn = plat.check_preexec_fn(args.preexec_fn)
    local close_fds = plat.check_close_fds(args.close_fds, pass_fds, args.stdin, args.stdout, args.stderr)
    local creationflags = plat.check_creationflags(args.creationflags or 0)
    local shell = (args.shell ~= nil) or false
@@ -210,13 +209,14 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
       if args.bufsize then self.stderr:setvbuf("full", args.bufsize) end
    end
    
-   local ok = plat.execute_child(args.args, args.executable, preexec_fn, close_fds,
-                                 pass_fds, args.cwd, args.env,
-                                 args.startupinfo, creationflags, shell,
-                                 p2cread, p2cwrite,
-                                 c2pread, c2pwrite,
-                                 errread, errwrite,
-                                 restore_signals, start_new_session)
+   local ok, err, errcode = plat.execute_child(
+                                args.args, args.executable, close_fds,
+                                pass_fds, args.cwd, args.env,
+                                args.startupinfo, creationflags, shell,
+                                p2cread, p2cwrite,
+                                c2pread, c2pwrite,
+                                errread, errwrite,
+                                restore_signals, start_new_session)
 
    if not ok then
       if self.stdin then self.stdin:close() end
@@ -227,6 +227,7 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
          if args.stdout == PIPE then c2pwrite:close() end
          if args.stderr == PIPE then errwrite:close() end
       end
+      return nil, err, errcode
    end
    
    if with_fn then

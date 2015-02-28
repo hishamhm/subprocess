@@ -92,13 +92,6 @@ local function list2cmdline(seq)
    return table.concat(result)
 end
 
-function subprocess_windows.check_preexec_fn(preexec_fn)
-   if preexec_fn then
-      error("preexec_fn is not supported on Windows platforms")
-   end
-   return nil
-end
-
 function subprocess_windows.check_close_fds(close_fds: boolean, pass_fds:{any}?, stdin: integer?, stdout: integer?, stderr: integer?)
    local any_stdio_set = stdin or stdout or stderr
    if close_fds == nil then

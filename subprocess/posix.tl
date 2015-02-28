@@ -7,6 +7,8 @@ local types = require("subprocess.types")
 local unistd = require("posix.unistd")
 local fcntl = require("posix.fcntl")
 local stdio = require("posix.stdio")
+local libgen = require("posix.dirname")
+local errno = require("posix.errno")
 
 local PIPE_BUF = unistd._PC_PIPE_BUF
 
@@ -15,10 +17,6 @@ local STDOUT = types.STDOUT
 local DEVNULL = types.DEVNULL
 
 subprocess_posix.MAXFD = unistd._SC_OPEN_MAX or 256
-
-function subprocess_posix.check_preexec_fn(preexec_fn)
-   return preexec_fn
-end
 
 function subprocess_posix.check_close_fds(close_fds: boolean, pass_fds:{any}?, stdin: integer?, stdout: integer?, stderr: integer?)
    if close_fds == nil then
@@ -107,15 +105,192 @@ function subprocess_posix.communicate(...)
    -- TODO
 end
 
-function subprocess_posix.execute_child(args.args, args.executable, preexec_fn, close_fds,
-                                        pass_fds, args.cwd, args.env,
-                                        args.startupinfo, creationflags, shell,
-                                        p2cread, p2cwrite,
-                                        c2pread, c2pwrite,
-                                        errread, errwrite,
-                                        restore_signals, start_new_session)
-   -- TODO
+local function make_set(array)
+   local set = {}
+   for _, elem in ipairs(array) do
+      set[elem] = true
+   end
+   return set
 end
 
+local function eintr_retry_call(fn, ...)
+   while true do
+      local res, err, errcode = fn(...)
+      if errcode ~= errno.EINTR then
+         return res, err, errcode
+      end
+   end
+end
+
+function subprocess_posix.execute_child(
+      self:Popen, cmd: PopenCmd, executable: string?, close_fds: boolean,
+      pass_fds: {any}, cwd, env,
+      startupinfo, creationflags, shell: boolean,
+      p2cread, p2cwrite,
+      c2pread, c2pwrite,
+      errread, errwrite,
+      restore_signals, start_new_session)
+
+   local args: {string} = {}
+   if type(cmd) == "string" then
+      args[1] = cmd
+   else
+      args = cmd
+   end
+   
+   if shell then
+      table.insert(args, 1, "/bin/sh")
+      table.insert(args, 2, "-c")
+      if executable then
+         args[1] = executable
+      end
+   end
+   
+   if not executable then
+      executable = args[1]
+   end
+   local orig_executable: string = executable
+   
+   --[[
+   For transferring possible exec failure from child to parent.
+   Data format: "exception name:hex errno:description"
+   ]]
+   local errpipe_read, errpipe_write = unistd.pipe()
+   local low_fds_to_close = {}
+   while errpipe_write < 3 do
+      table.insert(low_fds_to_close, errpipe_write)
+      errpipe_write = unistd.dup(errpipe_write)
+   end
+   for _, low_fd in ipairs(low_fds_to_close) do
+      low_fd:close()
+   end
+   
+   local errpipe_data = ""
+   pcall(function()
+      pcall(function()
+         --[[
+         We must avoid complex work that could involve
+         malloc or free in the child process to avoid
+         potential deadlocks, thus we do all this here.
+         and pass it to fork_exec()
+         ]]
+         local env_list = {}
+         if env and #env > 0 then
+            for k, v in pairs(env) do
+               table.insert(envlist, tostring(k).."="..tostring(v))
+            end
+         end
+         
+         local executable_list = {}
+         local dname = libgen.dirname(executable)
+         if dname == "." and executable:sub(1,2) ~= "./" then
+            -- This matches the behavior of execvpe()
+            local PATH = os.genenv("PATH")
+            for dir in PATH:gmatch("([^:]+):?") do
+               table.insert(executable_list, dir.."/"..executable)
+            end
+         else
+            executable_list[1] = executable
+         end
+         
+         local fds_to_keep = make_set(pass_fds)
+         fds_to_keep[errpipe_write] = true
+         
+         self.pid = core.fork_exec(args, executable_list,
+                                   close_fds, sorted(fds_to_keep),
+                                   cwd, env_list,
+                                   p2cread, p2cwrite, c2pread, c2pwrite,
+                                   errread, errwrite,
+                                   errpipe_read, errpipe_write,
+                                   restore_signals, start_new_session)
+         self.child_created = true
+      end)
+      -- be sure the FD is closed no matter what
+      errpipe_write:close()
+      
+      if p2cread ~= -1 and p2cwrite ~= -1 and p2cread ~= self.devnull then
+         p2cread:close()
+      end
+      if c2pwrite ~= -1 and c2pread ~= -1 and c2pwrite ~= self.devnull then
+         cp2write:close()
+      end
+      if errwrite ~= -1 and errread ~= -1 and errwrite ~= self.devnull then
+         errwrite:close()
+      end
+      if self.devnull then
+         self.devnull:close()
+      end
+      -- Prevent a double close of these fds on error.
+      self.closed_child_pipe_fds = true
+      
+      -- Wait for exec to fail or succeed; possibly raising an
+      -- exception (limited in size)
+      while true do
+         local part = eintr_retry_call(unistd.read, errpipe_read, 50000)
+         if not part then break end
+         errpipe_data = errpipe_data .. part
+         if #errpipe_data >= 50000 then
+            break
+         end
+      end
+   end)
+   -- be sure the FD is closed no matter what
+   errpipe_read:close()
+   
+   if #errpipe_data > 0 then
+      local pid, str, errcode = eintr_retry_call(wait.wait, self.pid)
+      if not pid and errcode ~= errno.ECHILD then
+         error(str)
+      end
+      
+      local exception_name, hex_errno, err_msg =
+         errpipe_data:match("([^:]+):([^:]+):([^:]+)")
+      if not exception_name then
+         hex_errno = "00"
+         err_msg = "Bad exception data from child: "..errpipe_data
+      end
+      return nil, err_msg, tonumber(hex_errno, 16)
+   end
+end
+
+--[[
+Check if child process has terminated.  Returns returncode
+attribute.
+
+This method is called by __gc, so it cannot reference anything
+outside of the local scope (nor can any methods it calls).
+]]
+do
+   local my_wait = wait.wait
+   local my_WNOHANG = wait.WNOHANG
+   local my_ECHILD = errno.ECHILD
+   function subprocess_posix.poll(self: Popen, deadstate: integer?)
+      if not self.returncode then
+         -- self.waidpid_lock:acquire()
+         -- if self.returncode then return self.returncode end
+         local pid, res, sts = my_wait(self.pid, my_WNOHANG)
+         if pid then
+            if pid == self.pid then
+               self:handle_exitstatus(sts)
+            end
+         else
+            if deadstate then
+               self.returncode = deadstate
+            elseif sts == my_ECHILD then
+               --[[
+               This happens if SIGCLD is set to be ignored or
+               waiting for child processes has otherwise been
+               disabled for our process.  This child is dead, we
+               can't get the status.
+               http://bugs.python.org/issue15756
+               ]]
+               self.returncode = 0
+            end
+         end
+         -- self.waitpid_lock:release()
+      end
+      return self.returncode
+   end
+end
 
 return subprocess_posix
