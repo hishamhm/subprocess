@@ -1,53 +1,54 @@
 
-typealias PopenCmd = string|{string}
-
 interface CalledProcessError
    type: string
    returncode: integer
-   cmd: PopenCmd
+   cmd: string|{string}
    output: string?
 end
 
 interface TimeoutExpired
    type: string
-   timeout: number
-   cmd: PopenCmd
+   timeout: number?
+   cmd: string|{string}
    output: string?
 end
 
 interface Popen
-   args: PopenCmd
+   args: string|{string}
    stdin: file?
    stdout: file?
    stderr: file?
    input: string?
+   input_offset: integer
    communication_started: boolean
-   pid: ?
-   returncode: ?
+   pid: integer?
+   returncode: integer?
    closed_child_pipe_fds: boolean
    child_created: boolean
-   devnull: file?
+   devnull: integer?
+   fileobj2output: {file:{string}}
    
    exit: () => ()
-   communicate(string?, number?) => (string?, string?)|(nil, nil, string)
-   poll: () => ({any}?) => any
+   communicate: (string?, number?) => (string?, string?)|(nil, nil, string)
+   poll: (integer?) => (integer)
    remaining_time: (number?) -> (number?)
    check_timeout: (number?, number?) => (nil)|(TimeoutExpired)
+   get_devnull: () -> (integer)
+   wait: (number?, number?) => (integer)
 end
 
 interface PopenArgs
-   args: PopenCmd
+   args: string|{string}
    bufsize: integer?
-   executable: ?
+   executable: string?
    stdin: file?
    stdout: file?
    stderr: file?
-   preexec_fn: ?
    close_fds: boolean?
    shell: boolean?
-   cwd: ?
-   env: ?
-   startupinfo: ?
+   cwd: string?
+   env: {string:string}?
+   startupinfo: any -- XXX
    creationflags: integer?
    restore_signals: boolean?
    start_new_session: boolean?

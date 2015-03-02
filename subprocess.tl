@@ -23,7 +23,7 @@ subprocess.PIPE = types.PIPE
 subprocess.STDOUT = types.PIPE
 subprocess.DEVNULL = types.PIPE
 
-local function CalledProcessError(returncode: integer, cmd: PopenCmd, output: string?): CalledProcessError
+local function CalledProcessError(returncode: integer, cmd: string|{string}, output: string?): CalledProcessError
    return {
       type = "CalledProcessError",
       returncode = returncode,
@@ -32,7 +32,7 @@ local function CalledProcessError(returncode: integer, cmd: PopenCmd, output: st
    }
 end
 
-local function TimeoutExpired(cmd: PopenCmd, timeout: integer, output: string?): TimeoutExpired
+local function TimeoutExpired(cmd: string|{string}, timeout: number?, output: string?): TimeoutExpired
    return {
       type = "TimeoutExpired",
       timeout = timeout,
@@ -50,7 +50,7 @@ zombie processes.
 local active: {Popen} = {}
 
 local function cleanup()
-   local mark: {integer} = {}
+   local mark: {number:integer} = {}
    for i, inst in ipairs(active) do
       local res = inst:poll(math.maxinteger)
       if res then
@@ -63,7 +63,7 @@ local function cleanup()
 end
 
 local Popen_metatable = {
-   __gc = function(self)
+   __gc = function(self:Popen)
       if not self.child_created then
          -- We didn't get to successfully create a child process.
          return
@@ -78,9 +78,9 @@ local Popen_metatable = {
 }
 
 local function exit(self: Popen)
-   if self.stdin then self.stdin:close() end
-   if self.stdout then self.stdout:close() end
-   if self.stderr then self.stderr:close() end
+   if self.stdin then plat.close(self.stdin) end
+   if self.stdout then plat.close(self.stdout) end
+   if self.stderr then plat.close(self.stderr) end
    -- Wait for the process to terminate, to avoid zombies.
    self:wait()
 end
@@ -102,18 +102,19 @@ function communicate(self: Popen, input: string?, timeout: number?): (string?, s
    if not timeout and not self.communication_started and nils >= 2 then
       stdout = nil
       stderr = nil
-      if self.stdin then
+      local self_stdin, self_stdout, self_stderr = self.stdin, self.stdout, self.stderr -- TL? can't infer on self...
+      if self_stdin then
          if input then
-            local ok, err = pcall(self.stdin.write, self.stdin, input)
+            local ok, err = pcall(self_stdin.write, self_stdin, input)
             if not ok then return nil, nil, err end
          end
-         self.stdin:close()
-      elseif self.stdout then
-         stdout = self.stdout:read("*a")
-         self.stdout:close()
-      elseif self.stderr then
-         stderr = self.stderr:read("*a")
-         self.stderr:close()
+         self_stdin:close()
+      elseif self_stdout then
+         stdout = self_stdout:read("*a")
+         self_stdout:close()
+      elseif self_stderr then
+         stderr = self_stderr:read("*a")
+         self_stderr:close()
       end
       self:wait()
    else
@@ -147,19 +148,22 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
    local restore_signals = (restore_signals ~= nil) or true
    local start_new_session = (args.start_new_session ~= nil) or false
 
-   local self: PopenObject = {
+   local self: Popen = {
       args = args.args,
       -- waitpid_lock = threading.Lock(), -- XXX not yet implemented
       input = nil,
+      input_offset = 0,
       communication_started = false,
       closed_child_pipe_fds = false,
       child_created = false,
+      fileobj2output = {},
       exit = exit,
       get_devnull = plat.get_devnull,
       communicate = communicate,
       poll = plat.poll,
       remaining_time = remaining_time,
       check_timeout = check_timeout,
+      wait = plat.wait,
    }
    setmetatable(self, Popen_metatable)
    

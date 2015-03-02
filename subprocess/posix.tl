@@ -7,8 +7,11 @@ local types = require("subprocess.types")
 local unistd = require("posix.unistd")
 local fcntl = require("posix.fcntl")
 local stdio = require("posix.stdio")
-local libgen = require("posix.dirname")
+local libgen = require("posix.libgen")
 local errno = require("posix.errno")
+local wait = require("posix.sys.wait")
+local time = require("posix.time")
+local core = require("subprocess.posix.core")
 
 local PIPE_BUF = unistd._PC_PIPE_BUF
 
@@ -22,8 +25,11 @@ function subprocess_posix.check_close_fds(close_fds: boolean, pass_fds:{any}?, s
    if close_fds == nil then
       return true
    end
-   if #pass_fds > 0 then
-      return true
+   -- TL? does not do inference in `and` expressions
+   if pass_fds then
+      if #pass_fds > 0 then
+         return true
+      end
    end
    return close_fds
 end
@@ -46,20 +52,21 @@ local function get_devnull(self: Popen)
    return self.devnull
 end
 
-function subprocess_posix.get_handles(self: Popen, stdin: file|integer|nil, stdout: file|integer|nil, stderr: file|integer|nil): integer,integer,integer,integer,integer,integer
+function subprocess_posix.get_handles(self: Popen, stdin: file|integer|nil, stdout: file|integer|nil, stderr: file|integer|nil): (integer,integer,integer,integer,integer,integer)
    local p2cread, p2cwrite = -1, -1
    local c2pread, c2pwrite = -1, -1
    local errread, errwrite = -1, -1
    local errno
    
    if stdin == PIPE then
-      p2cread, p2cwrite, errno = unistd.pipe()
-      if not p2cread then
-         error(p2cwrite, errno)
+      local r, w, e = unistd.pipe()
+      if not r then
+         error(w, e)
       end
+      p2cread, p2cwrite, errno = r, w, e
    elseif stdin == DEVNULL then
-      p2cread = get_devnull()
-   elseif type(stdin) == "number" then
+      p2cread = self:get_devnull()
+   elseif type(stdin) == "integer" then
       p2cread = stdin
    elseif stdin then
       -- Assuming file-like object
@@ -67,13 +74,14 @@ function subprocess_posix.get_handles(self: Popen, stdin: file|integer|nil, stdo
    end
 
    if stdout == PIPE then
-      c2pread, c2pwrite, errno = unistd.pipe()
-      if not c2pread then
-         error(c2pwrite, errno)
+      local r, w, e = unistd.pipe()
+      if not r then
+         error(w, e)
       end
+      c2pread, c2pwrite, errno = r, w, e
    elseif stdout == DEVNULL then
-      c2pwrite = get_devnull()
-   elseif type(stdout) == "number" then
+      c2pwrite = self:get_devnull()
+   elseif type(stdout) == "integer" then
       c2pwrite = stdout
    elseif stdout then
       -- Assuming file-like object
@@ -81,15 +89,16 @@ function subprocess_posix.get_handles(self: Popen, stdin: file|integer|nil, stdo
    end
 
    if stderr == PIPE then
-      errread, errwrite, errno = unistd.pipe()
-      if not errread then
-         error(errwrite, errno)
+      local r, w, e = unistd.pipe()
+      if not r then
+         error(w, e)
       end
+      errread, errwrite, errno = r, w, e
    elseif stderr == STDOUT then
       errwrite = c2pwrite
    elseif stderr == DEVNULL then
-      errwrite = get_devnull()
-   elseif type(stderr) == "number" then
+      errwrite = self:get_devnull()
+   elseif type(stderr) == "integer" then
       errwrite = stderr
    elseif stderr then
       -- Assuming file-like object
@@ -105,30 +114,43 @@ function subprocess_posix.communicate(...)
    -- TODO
 end
 
-local function make_set(array)
-   local set = {}
+local function make_set(array:{any}): {any:boolean}
+   local set: {any:boolean} = {}
    for _, elem in ipairs(array) do
       set[elem] = true
    end
    return set
 end
 
+local function sorted(set: {any:boolean})
+   local array: {any} = {}
+   for k, _ in pairs(set) do
+      table.insert(array, k)
+   end
+   table.sort(array)
+   return array
+end
+
+--[[
+Call functions that have the (nil, err, errno) protocol
+for errors, auto-retrying in case of EINTR.
+]]
 local function eintr_retry_call(fn, ...)
    while true do
       local res, err, errcode = fn(...)
-      if errcode ~= errno.EINTR then
+      if res ~= nil or errcode ~= errno.EINTR then
          return res, err, errcode
       end
    end
 end
 
 function subprocess_posix.execute_child(
-      self:Popen, cmd: PopenCmd, executable: string?, close_fds: boolean,
+      self:Popen, cmd: string|{string}, executable_p: string?, close_fds: boolean,
       pass_fds: {any}, cwd, env,
       startupinfo, creationflags, shell: boolean,
-      p2cread, p2cwrite,
-      c2pread, c2pwrite,
-      errread, errwrite,
+      p2cread: integer, p2cwrite: integer,
+      c2pread: integer, c2pwrite: integer,
+      errread: integer, errwrite: integer,
       restore_signals, start_new_session)
 
    local args: {string} = {}
@@ -141,28 +163,28 @@ function subprocess_posix.execute_child(
    if shell then
       table.insert(args, 1, "/bin/sh")
       table.insert(args, 2, "-c")
-      if executable then
-         args[1] = executable
+      if executable_p then
+         args[1] = executable_p
       end
    end
-   
-   if not executable then
-      executable = args[1]
-   end
-   local orig_executable: string = executable
+
+   local executable: string = executable_p or args[1]
    
    --[[
    For transferring possible exec failure from child to parent.
    Data format: "exception name:hex errno:description"
    ]]
    local errpipe_read, errpipe_write = unistd.pipe()
-   local low_fds_to_close = {}
+   if not errpipe_read then
+      error("could not open error pipe")
+   end
+   local low_fds_to_close: {integer} = {}
    while errpipe_write < 3 do
       table.insert(low_fds_to_close, errpipe_write)
       errpipe_write = unistd.dup(errpipe_write)
    end
    for _, low_fd in ipairs(low_fds_to_close) do
-      low_fd:close()
+      unistd.close(low_fd)
    end
    
    local errpipe_data = ""
@@ -174,18 +196,18 @@ function subprocess_posix.execute_child(
          potential deadlocks, thus we do all this here.
          and pass it to fork_exec()
          ]]
-         local env_list = {}
+         local env_list: {string} = {}
          if env and #env > 0 then
             for k, v in pairs(env) do
-               table.insert(envlist, tostring(k).."="..tostring(v))
+               table.insert(env_list, tostring(k).."="..tostring(v))
             end
          end
          
-         local executable_list = {}
+         local executable_list: {string} = {}
          local dname = libgen.dirname(executable)
          if dname == "." and executable:sub(1,2) ~= "./" then
             -- This matches the behavior of execvpe()
-            local PATH = os.genenv("PATH")
+            local PATH = os.getenv("PATH") or ""
             for dir in PATH:gmatch("([^:]+):?") do
                table.insert(executable_list, dir.."/"..executable)
             end
@@ -206,19 +228,20 @@ function subprocess_posix.execute_child(
          self.child_created = true
       end)
       -- be sure the FD is closed no matter what
-      errpipe_write:close()
+      unistd.close(errpipe_write)
       
       if p2cread ~= -1 and p2cwrite ~= -1 and p2cread ~= self.devnull then
-         p2cread:close()
+         unistd.close(p2cread)
       end
       if c2pwrite ~= -1 and c2pread ~= -1 and c2pwrite ~= self.devnull then
-         cp2write:close()
+         unistd.close(c2pwrite)
       end
       if errwrite ~= -1 and errread ~= -1 and errwrite ~= self.devnull then
-         errwrite:close()
+         unistd.close(errwrite)
       end
-      if self.devnull then
-         self.devnull:close()
+      local dn = self.devnull  -- TL? 
+      if dn then
+         unistd.close(dn)
       end
       -- Prevent a double close of these fds on error.
       self.closed_child_pipe_fds = true
@@ -235,7 +258,7 @@ function subprocess_posix.execute_child(
       end
    end)
    -- be sure the FD is closed no matter what
-   errpipe_read:close()
+   unistd.close(errpipe_read)
    
    if #errpipe_data > 0 then
       local pid, str, errcode = eintr_retry_call(wait.wait, self.pid)
@@ -253,6 +276,14 @@ function subprocess_posix.execute_child(
    end
 end
 
+local function handle_exitstatus(self: Popen, res: string, sts: integer)
+   if res == "exited" then
+      self.returcode = sts
+   else
+      self.returncode = -sts
+   end
+end
+
 --[[
 Check if child process has terminated.  Returns returncode
 attribute.
@@ -260,37 +291,129 @@ attribute.
 This method is called by __gc, so it cannot reference anything
 outside of the local scope (nor can any methods it calls).
 ]]
-do
-   local my_wait = wait.wait
-   local my_WNOHANG = wait.WNOHANG
-   local my_ECHILD = errno.ECHILD
-   function subprocess_posix.poll(self: Popen, deadstate: integer?)
-      if not self.returncode then
-         -- self.waidpid_lock:acquire()
-         -- if self.returncode then return self.returncode end
-         local pid, res, sts = my_wait(self.pid, my_WNOHANG)
-         if pid then
-            if pid == self.pid then
-               self:handle_exitstatus(sts)
-            end
-         else
-            if deadstate then
-               self.returncode = deadstate
-            elseif sts == my_ECHILD then
-               --[[
-               This happens if SIGCLD is set to be ignored or
-               waiting for child processes has otherwise been
-               disabled for our process.  This child is dead, we
-               can't get the status.
-               http://bugs.python.org/issue15756
-               ]]
-               self.returncode = 0
-            end
+local my_wait = wait.wait
+local my_WNOHANG = wait.WNOHANG
+local my_ECHILD = errno.ECHILD
+function subprocess_posix.poll(self: Popen, deadstate: integer?)
+   if not self.returncode then
+      -- self.waidpid_lock:acquire()
+      -- if self.returncode then return self.returncode end
+      local pid, res, sts = my_wait(self.pid, my_WNOHANG)
+      if pid then
+         if pid == self.pid then
+            handle_exitstatus(self, res, sts)
          end
-         -- self.waitpid_lock:release()
+      else
+         if deadstate then
+            self.returncode = deadstate
+         elseif sts == my_ECHILD then
+            --[[
+            This happens if SIGCLD is set to be ignored or
+            waiting for child processes has otherwise been
+            disabled for our process.  This child is dead, we
+            can't get the status.
+            http://bugs.python.org/issue15756
+            ]]
+            self.returncode = 0
+         end
       end
+      -- self.waitpid_lock:release()
+   end
+   return self.returncode
+end
+
+local function try_wait(self: Popen, wait_flags: integer?)
+   return eintr_retry_call(wait.wait, self.pid, wait_flags)
+end
+
+function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
+   if self.returncode then
       return self.returncode
+   end
+   
+   -- endtime is preferred to timeout.  timeout is only used for printing.
+   if endtime or timeout then
+      if not endtime then
+         endtime = time() + timeout
+      elseif not timeout then
+         timeout = self.remaining_time(endtime)
+      end
+   end
+
+   if endtime then
+      -- Enter a busy loop if we have a timeout.  This busy loop was
+      -- cribbed from Lib/threading.py in Thread.wait() at r71065.
+      local delay = 0.0005 -- 500 us -> initial delay of 1 ms
+      while true do
+         -- self.waitpid_lock:acquire(false)
+         if self.returncode then
+            break
+         end
+         local pid, ret, sts = try_wait(self, wait.WNOHANG)
+         assert(pid == self.pid or pid == 0)
+         if pid == self.pid then
+            handle_exitstatus(self, res, sts)
+            break
+         end
+         -- self.waitpid_lock:release(false)
+         local remaining = self.remaining_time(endtime)
+         if remaining <= 0 then
+            return nil, TimeoutExpired(self.args, timeout)
+         end
+         delay = math.min(delay * 2, remaining, .05)
+         time.nanosleep({tv_sec = math.floor(delay), tv_usec = (delay - math.floor(delay)) * 1000000000})
+      end
+   else
+      while not self.returncode do
+         -- self.waitpid_lock:acquire() do
+         local pid, ret, sts = try_wait(self, 0)
+         -- Check the pid and loop as waitpid has been known to
+         -- return 0 even without WNOHANG in odd situations.
+         -- http://bugs.python.org/issue14396.
+         if pid == self.pid then
+            handle_exitstatus(self, res, sts)
+         end
+         -- end self.waitpid_lock:release()
+      end
+   end
+   return self.returncode
+end
+
+function subprocess_posix.communicate(self: Popen, input:string?, endtime: number?, orig_timeout: number?)
+   if self.stdin and not self.communication_started then
+      -- Flush stdio buffer.  This might block, if the user has
+      -- been writing to .stdin in an uncontrolled fashion.
+      self.stdin:flush()
+      if not input then
+         self.stdin:close()
+      end
+
+      local stdout: {string}? = nil
+      local stderr: {string}? = nil
+
+      if not self.communication_started then
+         if self.stdout and not self.fileobj2output[self.stdout] then
+            self.fileobj2output[self.stdout] = {}
+         end
+         if self.stderr and not self.fileobj2output[self.stderr] then
+            self.fileobj2output[self.stderr] = {}
+         end
+      end
+      
+      stdout = self.stdout and self.fileobj2output[self.stdout]
+      stderr = self.stderr and self.fileobj2output[self.stderr]
+      
+      if self.stdin and not self.input then
+         self.input_offset = 0
+         self.input = input
+      end
+
    end
 end
 
+function subprocess_posix.close(fd: integer)
+   return unistd.close(fd)
+end
+
 return subprocess_posix
+
