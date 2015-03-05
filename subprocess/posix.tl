@@ -3,6 +3,7 @@
 local subprocess_posix = {}
 
 local types = require("subprocess.types")
+local exceptions = require("subprocess.exceptions")
 
 local unistd = require("posix.unistd")
 local fcntl = require("posix.fcntl")
@@ -151,9 +152,10 @@ function subprocess_posix.execute_child(
       p2cread: integer, p2cwrite: integer,
       c2pread: integer, c2pwrite: integer,
       errread: integer, errwrite: integer,
-      restore_signals, start_new_session)
+      start_new_session: boolean)
 
    local args: {string} = {}
+
    if type(cmd) == "string" then
       args[1] = cmd
    else
@@ -175,6 +177,7 @@ function subprocess_posix.execute_child(
    Data format: "exception name:hex errno:description"
    ]]
    local errpipe_read, errpipe_write = unistd.pipe()
+print("opened pipes", errpipe_read, errpipe_write)
    if not errpipe_read then
       error("could not open error pipe")
    end
@@ -196,8 +199,9 @@ function subprocess_posix.execute_child(
          potential deadlocks, thus we do all this here.
          and pass it to fork_exec()
          ]]
-         local env_list: {string} = {}
+         local env_list: {string}?
          if env and #env > 0 then
+            env_list = {}
             for k, v in pairs(env) do
                table.insert(env_list, tostring(k).."="..tostring(v))
             end
@@ -224,7 +228,8 @@ function subprocess_posix.execute_child(
                                    p2cread, p2cwrite, c2pread, c2pwrite,
                                    errread, errwrite,
                                    errpipe_read, errpipe_write,
-                                   restore_signals, start_new_session)
+                                   start_new_session)
+print("Forked ", self.pid)
          self.child_created = true
       end)
       -- be sure the FD is closed no matter what
@@ -245,17 +250,18 @@ function subprocess_posix.execute_child(
       end
       -- Prevent a double close of these fds on error.
       self.closed_child_pipe_fds = true
-      
+
       -- Wait for exec to fail or succeed; possibly raising an
       -- exception (limited in size)
       while true do
          local part = eintr_retry_call(unistd.read, errpipe_read, 50000)
-         if not part then break end
+         if not part or part == "" then break end
          errpipe_data = errpipe_data .. part
          if #errpipe_data >= 50000 then
             break
          end
       end
+
    end)
    -- be sure the FD is closed no matter what
    unistd.close(errpipe_read)
@@ -274,11 +280,12 @@ function subprocess_posix.execute_child(
       end
       return nil, err_msg, tonumber(hex_errno, 16)
    end
+   return self
 end
 
 local function handle_exitstatus(self: Popen, res: string, sts: integer)
    if res == "exited" then
-      self.returcode = sts
+      self.returncode = sts
    else
       self.returncode = -sts
    end
@@ -349,7 +356,7 @@ function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
          if self.returncode then
             break
          end
-         local pid, ret, sts = try_wait(self, wait.WNOHANG)
+         local pid, res, sts = try_wait(self, wait.WNOHANG)
          assert(pid == self.pid or pid == 0)
          if pid == self.pid then
             handle_exitstatus(self, res, sts)
@@ -358,7 +365,7 @@ function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
          -- self.waitpid_lock:release(false)
          local remaining = self.remaining_time(endtime)
          if remaining <= 0 then
-            return nil, TimeoutExpired(self.args, timeout)
+            return nil, exceptions.TimeoutExpired(self.args, timeout)
          end
          delay = math.min(delay * 2, remaining, .05)
          time.nanosleep({tv_sec = math.floor(delay), tv_usec = (delay - math.floor(delay)) * 1000000000})
@@ -366,7 +373,7 @@ function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
    else
       while not self.returncode do
          -- self.waitpid_lock:acquire() do
-         local pid, ret, sts = try_wait(self, 0)
+         local pid, res, sts = try_wait(self, 0)
          -- Check the pid and loop as waitpid has been known to
          -- return 0 even without WNOHANG in odd situations.
          -- http://bugs.python.org/issue14396.
@@ -379,39 +386,47 @@ function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
    return self.returncode
 end
 
+--[[
 function subprocess_posix.communicate(self: Popen, input:string?, endtime: number?, orig_timeout: number?)
-   if self.stdin and not self.communication_started then
-      -- Flush stdio buffer.  This might block, if the user has
-      -- been writing to .stdin in an uncontrolled fashion.
-      self.stdin:flush()
-      if not input then
-         self.stdin:close()
-      end
-
-      local stdout: {string}? = nil
-      local stderr: {string}? = nil
-
+   local stdin = self.stdin
+   if stdin then
       if not self.communication_started then
-         if self.stdout and not self.fileobj2output[self.stdout] then
-            self.fileobj2output[self.stdout] = {}
-         end
-         if self.stderr and not self.fileobj2output[self.stderr] then
-            self.fileobj2output[self.stderr] = {}
+         -- Flush stdio buffer.  This might block, if the user has
+         -- been writing to .stdin in an uncontrolled fashion.
+         stdin:flush()
+         if not input then
+            stdin:close()
          end
       end
-      
-      stdout = self.stdout and self.fileobj2output[self.stdout]
-      stderr = self.stderr and self.fileobj2output[self.stderr]
-      
-      if self.stdin and not self.input then
-         self.input_offset = 0
-         self.input = input
-      end
-
    end
+
+   --Only create this mapping if we haven't already.   
+   if not self.communication_started then
+      if self.stdout and not self.fileobj2output[self.stdout] then
+         self.fileobj2output[self.stdout] = {}
+      end
+      if self.stderr and not self.fileobj2output[self.stderr] then
+         self.fileobj2output[self.stderr] = {}
+      end
+   end
+   
+   local stdout: {string}? = self.stdout and self.fileobj2output[self.stdout]
+   local stderr: {string}? = self.stderr and self.fileobj2output[self.stderr]
+         
+   if stdin and not self.input then
+      self.input_offset = 0
+      self.input = input
+   end
+   
+   -- TODO port PopenSelector...
+end
+]]
+
+function subprocess_posix.open(fd: integer, mode:string): (file)|(nil,string,integer)
+   return stdio.fdopen(fd, mode)
 end
 
-function subprocess_posix.close(fd: integer)
+function subprocess_posix.close(fd: integer): (integer)|(nil, string, integer)
    return unistd.close(fd)
 end
 

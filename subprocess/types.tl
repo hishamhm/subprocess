@@ -18,6 +18,9 @@ interface Popen
    stdin: file?
    stdout: file?
    stderr: file?
+   stdin_buf: string
+   stdout_buf: string
+   stderr_buf: string
    input: string?
    input_offset: integer
    communication_started: boolean
@@ -26,12 +29,12 @@ interface Popen
    closed_child_pipe_fds: boolean
    child_created: boolean
    devnull: integer?
-   fileobj2output: {file:{string}}
+   fileobj2output: {any:{string}}
    
    exit: () => ()
    communicate: (string?, number?) => (string?, string?)|(nil, nil, string)
    poll: (integer?) => (integer)
-   remaining_time: (number?) -> (number?)
+   remaining_time: (number) -> (number)
    check_timeout: (number?, number?) => (nil)|(TimeoutExpired)
    get_devnull: () -> (integer)
    wait: (number?, number?) => (integer)
@@ -53,6 +56,7 @@ interface PopenArgs
    restore_signals: boolean?
    start_new_session: boolean?
    pass_fds: {any}?
+   timeout: number?
    -- universal_newlines: boolean XXX not implemented
 end
 

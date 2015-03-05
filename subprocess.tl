@@ -5,6 +5,7 @@ local subprocess = {}
 local mswindows = (package.cpath:lower()):match("%.dll")
 
 local types = require("subprocess.types")
+local exceptions = require("subprocess.exceptions")
 
 local plat
 if mswindows then
@@ -22,24 +23,6 @@ local DEVNULL = types.PIPE
 subprocess.PIPE = types.PIPE
 subprocess.STDOUT = types.PIPE
 subprocess.DEVNULL = types.PIPE
-
-local function CalledProcessError(returncode: integer, cmd: string|{string}, output: string?): CalledProcessError
-   return {
-      type = "CalledProcessError",
-      returncode = returncode,
-      cmd = cmd,
-      output = output,
-   }
-end
-
-local function TimeoutExpired(cmd: string|{string}, timeout: number?, output: string?): TimeoutExpired
-   return {
-      type = "TimeoutExpired",
-      timeout = timeout,
-      cmd = cmd,
-      output = output,
-   }
-end
 
 --[[
 This lists holds Popen instances for which the underlying process had not
@@ -78,9 +61,9 @@ local Popen_metatable = {
 }
 
 local function exit(self: Popen)
-   if self.stdin then plat.close(self.stdin) end
-   if self.stdout then plat.close(self.stdout) end
-   if self.stderr then plat.close(self.stderr) end
+   if self.stdin then self.stdin:close() end
+   if self.stdout then self.stdout:close() end
+   if self.stderr then self.stderr:close() end
    -- Wait for the process to terminate, to avoid zombies.
    self:wait()
 end
@@ -122,13 +105,13 @@ function communicate(self: Popen, input: string?, timeout: number?): (string?, s
       local ok
       ok, stdout, stderr = pcall(plat.communicate, input, endtime, timeout)
       self.communication_started = true
-      self:wait({ timeout = self.remaining_time(endtime) })
+      self:wait(endtime and self.remaining_time(endtime) or nil, endtime)
    end
    return stdout, stderr
 end
 
-local function remaining_time(endtime: number?)
-   return endtime and (endtime - plat.time())
+local function remaining_time(endtime: number): number
+   return (endtime - plat.time())
 end
 
 local function check_timeout(self: Popen, endtime: number?, orig_timeout: number?)
@@ -136,20 +119,31 @@ local function check_timeout(self: Popen, endtime: number?, orig_timeout: number
       return nil
    end
    if plat.time() > endtime then
-      return TimeoutExpired(self.args, orig_timeout)
+      return exceptions.TimeoutExpired(self.args, orig_timeout)
    end
 end
 
-function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
-   local pass_fds = args.pass_fds or {}
-   local close_fds = plat.check_close_fds(args.close_fds, pass_fds, args.stdin, args.stdout, args.stderr)
-   local creationflags = plat.check_creationflags(args.creationflags or 0)
-   local shell = (args.shell ~= nil) or false
-   local restore_signals = (restore_signals ~= nil) or true
-   local start_new_session = (args.start_new_session ~= nil) or false
+local function open_and_set_buf(fobj, fd, mode, bufsize)
+   local bufmode = "full"
+   if fd ~= -1 then
+      fobj, err = plat.open(fd, mode)
+print(fobj, err, "fd:", fd, mode)
+      if bufsize then
+         bufmode = bufsize > 0 and "full" or "no"
+         fobj:setvbuf(bufmode, bufsize)
+      end
+   end
+   return fobj, bufmode
+end
+
+function subprocess.Popen(args:string|{string}, kwargs:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
+   local pass_fds = kwargs.pass_fds or {}
+   local close_fds = plat.check_close_fds(kwargs.close_fds, pass_fds, kwargs.stdin, kwargs.stdout, kwargs.stderr)
+   local creationflags = plat.check_creationflags(kwargs.creationflags or 0)
+   local shell = (kwargs.shell ~= nil) or false
+   local start_new_session = kwargs.start_new_session and true or false
 
    local self: Popen = {
-      args = args.args,
       -- waitpid_lock = threading.Lock(), -- XXX not yet implemented
       input = nil,
       input_offset = 0,
@@ -157,6 +151,10 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
       closed_child_pipe_fds = false,
       child_created = false,
       fileobj2output = {},
+      stdin_buf = "full",
+      stdout_buf = "full",
+      stderr_buf = "full",
+      
       exit = exit,
       get_devnull = plat.get_devnull,
       communicate = communicate,
@@ -189,7 +187,7 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
    local 
    p2cread, p2cwrite,
    c2pread, c2pwrite,
-   errread, errwrite = get_handles(self, args.stdin, args.stdout, args.stderr)
+   errread, errwrite = plat.get_handles(self, kwargs.stdin, kwargs.stdout, kwargs.stderr)
 
    --[[
    We wrap OS handles *before* launching the child, otherwise a
@@ -198,38 +196,27 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
    
    p2cwrite, c2pread, errread = plat.wrap_handles(p2cwrite, c2pread, errread)
    
-   if p2cwrite ~= -1 then
-      self.stdin = io.open(p2cwrite, "wb")
-      if args.bufsize then self.stdin:setvbuf("full", args.bufsize) end
-   end
-
-   if c2pread ~= -1 then
-      self.stdout = io.open(c2pread, "rb")
-      if args.bufsize then self.stdout:setvbuf("full", args.bufsize) end
-   end
-
-   if errread ~= -1 then
-      self.stderr = io.open(errread, "rb")
-      if args.bufsize then self.stderr:setvbuf("full", args.bufsize) end
-   end
+   self.stdin,  self.stdin_buf  = open_and_set_buf(self.stdin,  p2cwrite, "wb", kwargs.bufsize)
+   self.stdout, self.stdout_buf = open_and_set_buf(self.stdout, c2pread, "rb", kwargs.bufsize)
+   self.stderr, self.stderr_buf = open_and_set_buf(self.stderr, errread, "rb", kwargs.bufsize)
    
-   local ok, err, errcode = plat.execute_child(
-                                args.args, args.executable, close_fds,
-                                pass_fds, args.cwd, args.env,
-                                args.startupinfo, creationflags, shell,
+   local ok, err, errcode = plat.execute_child(self, 
+                                args, kwargs.executable, close_fds,
+                                pass_fds, kwargs.cwd, kwargs.env,
+                                kwargs.startupinfo, creationflags, shell,
                                 p2cread, p2cwrite,
                                 c2pread, c2pwrite,
                                 errread, errwrite,
-                                restore_signals, start_new_session)
+                                start_new_session)
 
    if not ok then
       if self.stdin then self.stdin:close() end
       if self.stdout then self.stdout:close() end
       if self.stderr then self.stderr:close() end
       if not self.closed_child_pipe_fds then
-         if args.stdin == PIPE then p2cread:close() end
-         if args.stdout == PIPE then c2pwrite:close() end
-         if args.stderr == PIPE then errwrite:close() end
+         if kwargs.stdin == PIPE then plat.close(p2cread) end
+         if kwargs.stdout == PIPE then plat.close(c2pwrite) end
+         if kwargs.stderr == PIPE then plat.close(errwrite) end
       end
       return nil, err, errcode
    end
@@ -243,8 +230,8 @@ function Popen(args:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
    return self
 end
 
-function subprocess.call(args: PopenArgs)
-   return Popen(args, function(p)
+function subprocess.call(args:string|{string}, kwargs:PopenArgs)
+   return Popen(args, kwargs, function(p)
       local exit, err = p:wait(args.timeout)
       if err then
          p:kill()
@@ -255,15 +242,16 @@ function subprocess.call(args: PopenArgs)
    end)
 end
 
-function subprocess.check_call(args: PopenArgs)
-   local exit, err = subprocess.call(args)
+function subprocess.check_call(args:string|{string}, kwargs:PopenArgs)
+   local exit, err = subprocess.call(args, kwargs)
    if exit ~= 0 then
       error("Error calling process: "..tostring(exit).." "..tostring(err))
    end
    return 0
 end
 
-function subprocess.check_output(args: PopenArgs)
+--[[
+function subprocess.check_output(args:string|{string}, kwargs:PopenArgs)
    if args.stdout then
       error("stdout argument not allowed, it will be overridden.")
    end
@@ -278,12 +266,12 @@ function subprocess.check_output(args: PopenArgs)
    end
    
    args.stdout = PIPE
-   return Popen(args, function(process)
+   return Popen(args, kwargs, function(process)
       local output, err = process:communicate(inputdata, args.timeout)
       if err == "TimeoutExpired" then
          process:kill()
          output, err = process:communicate()
-         return nil, TimeoutExpired(args.args, timeout, output)
+         return nil, exceptions.TimeoutExpired(args, timeout, output)
       elseif err then
          process:kill()
          process:wait()
@@ -291,7 +279,7 @@ function subprocess.check_output(args: PopenArgs)
       end
       local retcode = process:poll()
       if retcode > 0 then
-         return nil, CalledProcessError(retcode, process.args, output)
+         return nil, exceptions.CalledProcessError(retcode, process.args, output)
       end
       return output
    end)
@@ -299,7 +287,7 @@ end
 
 function subprocess.getstatusoutput(cmd: string)
    local status = 0
-   local data, err = subprocess.check_output({args = cmd, shell = true, stderr = STDOUT})
+   local data, err = subprocess.check_output(cmd, {shell = true, stderr = STDOUT})
    if err and err.type == "CalledProcessError" then
       data = err.output
       status = err.returncode
@@ -314,5 +302,6 @@ function subprocess.getoutput(cmd: string)
    local _, data = subprocess.getstatusoutput(cmd)
    return data
 end
+]]
 
 return subprocess
