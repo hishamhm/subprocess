@@ -126,8 +126,8 @@ end
 local function open_and_set_buf(fobj, fd, mode, bufsize)
    local bufmode = "full"
    if fd ~= -1 then
+      local err
       fobj, err = plat.open(fd, mode)
-print(fobj, err, "fd:", fd, mode)
       if bufsize then
          bufmode = bufsize > 0 and "full" or "no"
          fobj:setvbuf(bufmode, bufsize)
@@ -231,8 +231,8 @@ function subprocess.Popen(args:string|{string}, kwargs:PopenArgs, with_fn: nil|(
 end
 
 function subprocess.call(args:string|{string}, kwargs:PopenArgs)
-   return Popen(args, kwargs, function(p)
-      local exit, err = p:wait(args.timeout)
+   return subprocess.Popen(args, kwargs, function(p)
+      local exit, err = p:wait(kwargs.timeout)
       if err then
          p:kill()
          p:wait()

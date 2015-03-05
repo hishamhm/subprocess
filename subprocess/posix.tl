@@ -177,7 +177,6 @@ function subprocess_posix.execute_child(
    Data format: "exception name:hex errno:description"
    ]]
    local errpipe_read, errpipe_write = unistd.pipe()
-print("opened pipes", errpipe_read, errpipe_write)
    if not errpipe_read then
       error("could not open error pipe")
    end
@@ -229,7 +228,6 @@ print("opened pipes", errpipe_read, errpipe_write)
                                    errread, errwrite,
                                    errpipe_read, errpipe_write,
                                    start_new_session)
-print("Forked ", self.pid)
          self.child_created = true
       end)
       -- be sure the FD is closed no matter what
