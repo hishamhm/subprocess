@@ -2,7 +2,6 @@ package = "subprocess"
 version = "scm-1"
 source = {
    url = "git://github.com/hishamhm/subprocess",
-   tag = "scm-1"
 }
 description = {
    summary = "A port of the Python subprocess module to Lua",
