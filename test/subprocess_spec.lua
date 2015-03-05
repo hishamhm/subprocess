@@ -3,8 +3,10 @@ local subprocess = require("subprocess")
 
 local executable = "lua"
 
-function describe(d, f) local ok, err = pcall(f); if not ok then print("Fail: "..err) end end
-function it(d, f) local ok, err = pcall(f); if not ok then print("Fail: "..err) end end
+if not describe then
+   function describe(d, f) local ok, err = pcall(f); if not ok then print("Fail: "..err) end end
+   function it(d, f) local ok, err = pcall(f); if not ok then print("Fail: "..err) end end
+end
 
 describe("subprocess module", function()
    describe("process test case", function()
