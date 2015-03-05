@@ -5,13 +5,16 @@ local subprocess_posix = {}
 local types = require("subprocess.types")
 local exceptions = require("subprocess.exceptions")
 
-local unistd = require("posix.unistd")
-local fcntl = require("posix.fcntl")
-local stdio = require("posix.stdio")
-local libgen = require("posix.libgen")
 local errno = require("posix.errno")
+local fcntl = require("posix.fcntl")
+local libgen = require("posix.libgen")
+local posix_sys_time = require("posix.sys.time")
+local posix_time = require("posix.time")
+local signal = require("posix.signal")
+local stdio = require("posix.stdio")
+local unistd = require("posix.unistd")
 local wait = require("posix.sys.wait")
-local time = require("posix.time")
+
 local core = require("subprocess.posix.core")
 
 local PIPE_BUF = unistd._PC_PIPE_BUF
@@ -21,6 +24,11 @@ local STDOUT = types.STDOUT
 local DEVNULL = types.DEVNULL
 
 subprocess_posix.MAXFD = unistd._SC_OPEN_MAX or 256
+
+function subprocess_posix.time()
+   local tv = posix_sys_time.gettimeofday()
+   return tv.tv_sec + (tv.tv_usec / 1000000)
+end
 
 function subprocess_posix.check_close_fds(close_fds: boolean, pass_fds:{any}?, stdin: integer?, stdout: integer?, stderr: integer?)
    if close_fds == nil then
@@ -169,6 +177,7 @@ function subprocess_posix.execute_child(
          args[1] = executable_p
       end
    end
+   self.args = args
 
    local executable: string = executable_p or args[1]
    
@@ -245,6 +254,7 @@ function subprocess_posix.execute_child(
       local dn = self.devnull  -- TL? 
       if dn then
          unistd.close(dn)
+         self.devnull = nil
       end
       -- Prevent a double close of these fds on error.
       self.closed_child_pipe_fds = true
@@ -259,11 +269,9 @@ function subprocess_posix.execute_child(
             break
          end
       end
-
    end)
    -- be sure the FD is closed no matter what
    unistd.close(errpipe_read)
-   
    if #errpipe_data > 0 then
       local pid, str, errcode = eintr_retry_call(wait.wait, self.pid)
       if not pid and errcode ~= errno.ECHILD then
@@ -335,16 +343,14 @@ function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
    if self.returncode then
       return self.returncode
    end
-   
    -- endtime is preferred to timeout.  timeout is only used for printing.
    if endtime or timeout then
       if not endtime then
-         endtime = time() + timeout
+         endtime = subprocess_posix.time() + timeout
       elseif not timeout then
          timeout = self.remaining_time(endtime)
       end
    end
-
    if endtime then
       -- Enter a busy loop if we have a timeout.  This busy loop was
       -- cribbed from Lib/threading.py in Thread.wait() at r71065.
@@ -363,10 +369,10 @@ function subprocess_posix.wait(self: Popen, timeout: number?, endtime: number?)
          -- self.waitpid_lock:release(false)
          local remaining = self.remaining_time(endtime)
          if remaining <= 0 then
-            return nil, exceptions.TimeoutExpired(self.args, timeout)
+            return nil, exceptions.TimeoutExpired(self.cmd, timeout)
          end
          delay = math.min(delay * 2, remaining, .05)
-         time.nanosleep({tv_sec = math.floor(delay), tv_usec = (delay - math.floor(delay)) * 1000000000})
+         posix_time.nanosleep({tv_sec = math.floor(delay), tv_nsec = (delay - math.floor(delay)) * 1000000000})
       end
    else
       while not self.returncode do
@@ -419,6 +425,14 @@ function subprocess_posix.communicate(self: Popen, input:string?, endtime: numbe
    -- TODO port PopenSelector...
 end
 ]]
+
+function subprocess_posix.kill(self: Popen)
+   signal.kill(self.pid, signal.SIGKILL)
+end
+
+function subprocess_posix.terminate(self: Popen)
+   signal.kill(self.pid, signal.SIGTERM)
+end
 
 function subprocess_posix.open(fd: integer, mode:string): (file)|(nil,string,integer)
    return stdio.fdopen(fd, mode)

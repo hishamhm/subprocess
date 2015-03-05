@@ -119,7 +119,7 @@ local function check_timeout(self: Popen, endtime: number?, orig_timeout: number
       return nil
    end
    if plat.time() > endtime then
-      return exceptions.TimeoutExpired(self.args, orig_timeout)
+      return nil, exceptions.TimeoutExpired(self.args, orig_timeout)
    end
 end
 
@@ -137,6 +137,7 @@ local function open_and_set_buf(fobj, fd, mode, bufsize)
 end
 
 function subprocess.Popen(args:string|{string}, kwargs:PopenArgs, with_fn: nil|(Popen) -> ()): Popen
+   if not kwargs then kwargs = {} end
    local pass_fds = kwargs.pass_fds or {}
    local close_fds = plat.check_close_fds(kwargs.close_fds, pass_fds, kwargs.stdin, kwargs.stdout, kwargs.stderr)
    local creationflags = plat.check_creationflags(kwargs.creationflags or 0)
@@ -144,6 +145,7 @@ function subprocess.Popen(args:string|{string}, kwargs:PopenArgs, with_fn: nil|(
    local start_new_session = kwargs.start_new_session and true or false
 
    local self: Popen = {
+      args = args,
       -- waitpid_lock = threading.Lock(), -- XXX not yet implemented
       input = nil,
       input_offset = 0,
@@ -162,6 +164,8 @@ function subprocess.Popen(args:string|{string}, kwargs:PopenArgs, with_fn: nil|(
       remaining_time = remaining_time,
       check_timeout = check_timeout,
       wait = plat.wait,
+      kill = plat.kill,
+      terminate = plat.terminate,
    }
    setmetatable(self, Popen_metatable)
    
@@ -220,11 +224,10 @@ function subprocess.Popen(args:string|{string}, kwargs:PopenArgs, with_fn: nil|(
       end
       return nil, err, errcode
    end
-   
    if with_fn then
-      local ret = { with_fn(self) }
+      local ret = table.pack( with_fn(self) )
       self:exit()
-      return table.unpack(ret)
+      return table.unpack(ret, 1, ret.n)
    end
    
    return self
@@ -232,7 +235,7 @@ end
 
 function subprocess.call(args:string|{string}, kwargs:PopenArgs)
    return subprocess.Popen(args, kwargs, function(p)
-      local exit, err = p:wait(kwargs.timeout)
+      local exit, err = p:wait(kwargs and kwargs.timeout)
       if err then
          p:kill()
          p:wait()

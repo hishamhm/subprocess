@@ -32,12 +32,13 @@ interface Popen
    fileobj2output: {any:{string}}
    
    exit: () => ()
-   communicate: (string?, number?) => (string?, string?)|(nil, nil, string)
    poll: (integer?) => (integer)
    remaining_time: (number) -> (number)
    check_timeout: (number?, number?) => (nil)|(TimeoutExpired)
    get_devnull: () -> (integer)
    wait: (number?, number?) => (integer)
+   kill: () => ()
+   terminate: () => ()
 end
 
 interface PopenArgs

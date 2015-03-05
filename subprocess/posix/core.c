@@ -77,7 +77,6 @@ failure:
 int make_inheritable(lua_State* L, int FDS_TO_KEEP, lua_Integer errpipe_write) {
    lua_Integer len;
    int i = 0;
-   
    len = luaL_len(L, FDS_TO_KEEP);
    for (i = 0; i < len; ++i) {
       long fd;
@@ -86,6 +85,7 @@ int make_inheritable(lua_State* L, int FDS_TO_KEEP, lua_Integer errpipe_write) {
       lua_pop(L, 1);
       assert(0 <= fd && fd <= INT_MAX);
       if (fd == errpipe_write) {
+         set_inheritable((int)fd, 0);
          continue;
       }
       if (set_inheritable((int)fd, 1) < 0) {
@@ -185,9 +185,7 @@ int child_exec(char** exec_array, char** argv, char** envp, const char* cwd,
       POSIX_CALL(setsid());
    }
 
-   /* close FDs after executing preexec_fn, which might open FDs */
    if (close_fds) {
-      /* TODO HP-UX could use pstat_getproc() if anyone cares about it. */
       close_open_fds(3, L, FDS_TO_KEEP);
    }
 
