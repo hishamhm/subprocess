@@ -26,11 +26,11 @@ all: $(POSIX_CORE) $(LUACS) test
 lua: $(LUAS)
 luac: $(LUACS)
 
-test:
+test: $(LUACS)
 	LUA_PATH="$$PWD/?.luac;$$LUA_PATH" lua test/subprocess_spec.lua
 
 busted: $(LUAS)
-	LUA_PATH="$$PWD/?.luac;$$LUA_PATH" busted test
+	LUA_PATH="$$PWD/?.lua;$$LUA_PATH" busted test
 
 $(POSIX_CORE): $(POSIX_CORE_SOURCES) $(POSIX_CORE_HEADERS) 
 	$(CC) $(CFLAGS) $(LIBFLAG) -o $@ -I$(LUA_INCDIR) $(POSIX_CORE_SOURCES) `$(EXISTS) "$(SYSCALL_INCDIR)/sys/syscall.h" && $(ECHO) "-DHAVE_SYS_SYSCALL_H"`

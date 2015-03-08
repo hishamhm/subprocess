@@ -38,6 +38,19 @@ describe("subprocess module", function()
          local rc, err = subprocess.call({executable, '-e', 'while true do end'}, {timeout = 0.1})
          assert((not rc) and err.type == "TimeoutExpired")
       end)
+      it("gets output from stdout", function ()
+         local p = subprocess.Popen({executable, '-e', 'print("one");print("two");print("three")'}, {stdout = subprocess.PIPE})
+         assert(p.stdout)
+         local text = ""
+         local count = 0
+         for line in p.stdout:lines() do
+            text = text .. line 
+            count = count + 1
+         end
+         assert(count == 3)
+         assert(text == "onetwothree")
+         p:wait()
+      end)
    end)
 end)
 
