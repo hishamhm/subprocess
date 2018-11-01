@@ -2,6 +2,7 @@
 subprocess
 ==========
 
+This is a fork of 'subprocess'. 
 A port of the Python subprocess module to (Typed) Lua.
 
 Current status 
